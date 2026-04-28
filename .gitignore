@@ -1,17 +1,12 @@
-# Build output
-[Bb]in/
-[Oo]bj/
-x86/
-x64/Debug/
+# Build output (anywhere in tree)
+**/[Bb]in/
+**/[Oo]bj/
+**/x86/
+**/x64/Debug/
+**/Debug/
+**/.vs/
 
-# VS / user-specific
-.vs/
-*.suo
-*.user
-*.VC.db
-*.VC.opendb
-
-# Build artifacts (allow x64/Release/*.dll)
+# Build artifacts (anywhere)
 *.obj
 *.pdb
 *.ilk
@@ -19,6 +14,20 @@ x64/Debug/
 *.lib
 *.tlog
 *.lastbuildstate
+*.recipe
+*.iobj
+*.ipdb
+*.idb
+*.log
+*.FileListAbsolute.txt
+*.CppClean.log
+vcpkg.applocal.log
+
+# VS / user-specific
+*.suo
+*.user
+*.VC.db
+*.VC.opendb
 
 # Packages
 vcpkg_installed/
@@ -35,3 +44,7 @@ packages/
 # OS
 .DS_Store
 Thumbs.db
+
+# Don't ship MinHook DLLs (static-linked)
+minhook.x64.dll
+minhook.x64d.dll

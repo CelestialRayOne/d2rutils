@@ -1,0 +1,8 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="d2rutils/d2rutils.vcxproj" />
+  <Project Path="StashSearch/StashSearch.vcxproj" />
+</Solution>
