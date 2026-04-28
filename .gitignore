@@ -1,0 +1,37 @@
+# Build output
+[Bb]in/
+[Oo]bj/
+x86/
+x64/Debug/
+
+# VS / user-specific
+.vs/
+*.suo
+*.user
+*.VC.db
+*.VC.opendb
+
+# Build artifacts (allow x64/Release/*.dll)
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.tlog
+*.lastbuildstate
+
+# Packages
+vcpkg_installed/
+packages/
+
+# IDA
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+
+# OS
+.DS_Store
+Thumbs.db
