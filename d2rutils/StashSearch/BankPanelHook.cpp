@@ -1,6 +1,5 @@
 #include <Windows.h>
 #include <MinHook.h>
-#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <cctype>
@@ -10,15 +9,14 @@
 namespace {
     constexpr uint32_t RVA_BankPanelDraw = 0x18EB90;
     constexpr uint32_t RVA_WidgetFindChild = 0x576070;
-    constexpr uint32_t RVA_StringTableLookup = 0x413860;
     constexpr uint32_t RVA_ItemsTablePtr = 0x1CA0390;
     constexpr uint32_t RVA_ItemsTableCount = 0x1CA0398;
-    constexpr uint32_t RVA_StringTablePtr = 0x1856688;
     constexpr uint32_t RVA_UnitHashItems = 0x1D442E0 + 4 * 0x400;
     constexpr uint32_t RVA_PlayerUnitHash = 0x1D442E0;
     constexpr uint32_t RVA_PanelManager = 0x1D7C4E8;
     constexpr uint32_t RVA_DrawFilledRect = 0x439280;
     constexpr uint32_t RVA_ResolvePos = 0x576F00;
+    constexpr uint32_t RVA_ItemsGetName = 0x149B60;
 
     constexpr size_t OFF_UnitClassId = 0x04;
     constexpr size_t OFF_UnitItemData = 0x10;
@@ -29,7 +27,6 @@ namespace {
     constexpr size_t OFF_ItemDataContainerId = 0x0C;
     constexpr size_t OFF_ItemDataPage = 0xB8;
     constexpr size_t ROW_STRIDE = 0x1B4;
-    constexpr size_t OFF_RowNameId = 0xFC;
     constexpr size_t OFF_RowInvWidth = 0x116;
     constexpr size_t OFF_RowInvHeight = 0x117;
 
@@ -38,8 +35,7 @@ namespace {
 
     constexpr size_t OFF_InvSharedTabsPtr = 0x68;
 
-    constexpr size_t OFF_WidgetRectX = 0x70;
-    constexpr size_t OFF_WidgetRectY = 0x74;
+    constexpr size_t OFF_WidgetParent = 0x30;
     constexpr size_t OFF_WidgetRectW = 0x78;
     constexpr size_t OFF_WidgetRectH = 0x7C;
     constexpr size_t OFF_WidgetScale = 0x80;
@@ -66,13 +62,12 @@ namespace {
 
     using BankPanelDraw_t = void(__fastcall*)(void* pBankPanel);
     using WidgetFindChild_t = void* (__fastcall*)(void* pParent, const char* name);
-    using StringLookup_t = const char* (__fastcall*)(uint16_t key, void* stringTable);
     using DrawFilledRect_t = void(__fastcall*)(int x1, int y1, int x2, int y2, const float color[4]);
     using ResolvePos_t = uint64_t(__fastcall*)(void* pWidget, uint64_t* outXY);
+    using ItemsGetName_t = void(__fastcall*)(void* pUnit, char* pBuffer);
 
     BankPanelDraw_t   oBankPanelDraw = nullptr;
     WidgetFindChild_t pWidgetFindChild = nullptr;
-    StringLookup_t    pStringLookup = nullptr;
     DrawFilledRect_t  pDrawFilledRect = nullptr;
 
     std::atomic<void*> g_searchWidget{ nullptr };
@@ -125,25 +120,14 @@ namespace {
         return false;
     }
 
-    const char* ResolveItemName(uint32_t classId) {
-        auto itemsBase = *reinterpret_cast<uint8_t**>(Pattern::Address(RVA_ItemsTablePtr));
-        auto maxId = *reinterpret_cast<uint32_t*>(Pattern::Address(RVA_ItemsTableCount));
-        if (!itemsBase || classId >= maxId) return nullptr;
-        uint16_t nameId = *reinterpret_cast<uint16_t*>(itemsBase + classId * ROW_STRIDE + OFF_RowNameId);
-        void* stringTable = *reinterpret_cast<void**>(Pattern::Address(RVA_StringTablePtr));
-        if (!stringTable) return nullptr;
-        const char* result = pStringLookup(nameId, stringTable);
-        if (!result || reinterpret_cast<const void*>(result) == stringTable) return nullptr;
-        return result;
-    }
-
     bool ItemMatches(uint8_t* pItem, const char* needle) {
         if (!pItem) return false;
-        uint32_t classId = *reinterpret_cast<uint32_t*>(pItem + OFF_UnitClassId);
-        const char* raw = ResolveItemName(classId);
-        if (!raw) return false;
-        char clean[128];
-        StripColorCodes(raw, clean, sizeof(clean));
+        auto getName = reinterpret_cast<ItemsGetName_t>(Pattern::Address(RVA_ItemsGetName));
+        char buf[0x400] = {};
+        getName(pItem, buf);
+        if (!buf[0]) return false;
+        char clean[0x400];
+        StripColorCodes(buf, clean, sizeof(clean));
         return ContainsCI(clean, needle);
     }
 
@@ -188,6 +172,8 @@ namespace {
         return true;
     }
 
+    // Walk the widget's parent chain (via [pWidget+0x30]), multiplying each
+    // node's scale at +0x80. Some mods nest the stash inside scaled parents.
     float ResolveAccumulatedScale(void* pWidget) {
         if (!pWidget) return 1.0f;
         float accum = 1.0f;
@@ -195,7 +181,7 @@ namespace {
         for (int depth = 0; node && depth < 16; depth++) {
             float s = *reinterpret_cast<float*>(node + OFF_WidgetScale);
             if (s > 0.001f) accum *= s;
-            node = *reinterpret_cast<uint8_t**>(node + 0x30);
+            node = *reinterpret_cast<uint8_t**>(node + OFF_WidgetParent);
         }
         return accum;
     }
@@ -250,6 +236,7 @@ namespace {
         return nullptr;
     }
 
+    // Active tab = the BankTabs child Image whose +0x90 byte is 1.
     int GetActiveTabIndex(void* pBankPanel) {
         void* pTabs = pWidgetFindChild(pBankPanel, "BankTabs");
         if (!pTabs) return -1;
@@ -263,10 +250,8 @@ namespace {
             const char* name = *reinterpret_cast<const char**>(child + OFF_NodeNamePtr);
             if (!name) continue;
             if (name[0] == 'I' && name[1] == 'm' && name[2] == 'a' && name[3] == 'g' && name[4] == 'e') {
-                uint8_t active = *(child + OFF_TabImageActive);
-                if (active == 1) {
-                    int idx = atoi(name + 5);
-                    return idx;
+                if (*(child + OFF_TabImageActive) == 1) {
+                    return atoi(name + 5);
                 }
             }
         }
@@ -360,27 +345,6 @@ namespace {
         }
     }
 
-    int CountVisibleTabMatches(const char* needle, void* pBankPanel) {
-        uint32_t visibleCid = GetVisibleContainerId(pBankPanel);
-        if (visibleCid == 0) return 0;
-        auto buckets = reinterpret_cast<uint8_t**>(Pattern::Address(RVA_UnitHashItems));
-        int matches = 0;
-        for (int i = 0; i < 128; i++) {
-            auto unit = buckets[i];
-            while (unit) {
-                auto pItemData = *reinterpret_cast<uint8_t**>(unit + OFF_UnitItemData);
-                if (pItemData && pItemData[OFF_ItemDataPage] == PAGE_STASH) {
-                    uint32_t cid = *reinterpret_cast<uint32_t*>(pItemData + OFF_ItemDataContainerId);
-                    if (cid == visibleCid && ItemMatches(unit, needle)) {
-                        matches++;
-                    }
-                }
-                unit = *reinterpret_cast<uint8_t**>(unit + OFF_UnitNext);
-            }
-        }
-        return matches;
-    }
-
     void __fastcall HookedBankPanelDraw(void* pBankPanel) {
         oBankPanelDraw(pBankPanel);
 
@@ -435,7 +399,6 @@ bool IsDropGoldModalOpen() {
 
 bool InstallBankPanelHook() {
     pWidgetFindChild = reinterpret_cast<WidgetFindChild_t>(Pattern::Address(RVA_WidgetFindChild));
-    pStringLookup = reinterpret_cast<StringLookup_t>(Pattern::Address(RVA_StringTableLookup));
     pDrawFilledRect = reinterpret_cast<DrawFilledRect_t>(Pattern::Address(RVA_DrawFilledRect));
     LPVOID target = reinterpret_cast<LPVOID>(Pattern::Address(RVA_BankPanelDraw));
     if (MH_CreateHook(target,
