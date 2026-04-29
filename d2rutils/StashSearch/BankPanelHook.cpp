@@ -120,15 +120,49 @@ namespace {
         return false;
     }
 
-    bool ItemMatches(uint8_t* pItem, const char* needle) {
-        if (!pItem) return false;
-        auto getName = reinterpret_cast<ItemsGetName_t>(Pattern::Address(RVA_ItemsGetName));
+    static char* GetLastTwoLines(char* str)
+    {
+        if (!str || !*str)
+            return str;
+
+        char* last = str;
+        char* secondLast = nullptr;
+
+        for (char* p = str; *p; ++p)
+        {
+            if (*p == '\n')
+            {
+                secondLast = last;
+                last = p + 1;
+            }
+        }
+
+        if (!secondLast)
+            return str;
+
+        return secondLast;
+    }
+
+    bool ItemMatches(uint8_t* pItem, const char* needle)
+    {
+        if (!pItem || !needle)
+            return false;
+
+        auto getName = reinterpret_cast<ItemsGetName_t>(
+            Pattern::Address(RVA_ItemsGetName)
+            );
+
         char buf[0x400] = {};
         getName(pItem, buf);
-        if (!buf[0]) return false;
-        char clean[0x400];
+
+        if (!buf[0])
+            return false;
+
+        char clean[0x400] = {};
         StripColorCodes(buf, clean, sizeof(clean));
-        return ContainsCI(clean, needle);
+        char* filtered = GetLastTwoLines(clean);
+
+        return ContainsCI(filtered, needle);
     }
 
     void GetItemDimensions(uint32_t classId, uint8_t& outW, uint8_t& outH) {
