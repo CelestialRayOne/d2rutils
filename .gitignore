@@ -48,3 +48,9 @@ Thumbs.db
 # Don't ship MinHook DLLs (static-linked)
 minhook.x64.dll
 minhook.x64d.dll
+
+States512/x64/
+States512/Debug/
+States512/Release/
+States512/*.user
+States512/minhook/.git/

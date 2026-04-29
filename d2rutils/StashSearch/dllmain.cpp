@@ -1,5 +1,6 @@
 #include <Windows.h>
 #include <MinHook.h>
+#include <cstdio>
 
 bool InstallBankPanelHook();
 void UninstallBankPanelHook();

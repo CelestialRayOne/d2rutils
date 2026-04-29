@@ -3,6 +3,8 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="d2rutils/d2rutils.vcxproj" />
-  <Project Path="StashSearch/StashSearch.vcxproj" />
+  <Project Path="d2rutils/d2rutils.vcxproj" Id="30b7a528-075a-40f8-9578-32762d534ceb" />
+  <Project Path="StashSearch/StashSearch.vcxproj" Id="b8d32463-2528-4c32-b587-5a7ce37f43ce" />
+  <Project Path="StateExtension/minhook/build/VC17/libMinHook.vcxproj" Id="f142a341-5ee0-442d-a15f-98ae9b48dbae" />
+  <Project Path="StateExtension/StateExtension.vcxproj" Id="1e38f7ff-800e-4883-95c1-73297e88ce50" />
 </Solution>

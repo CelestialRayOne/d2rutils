@@ -1,18 +1,6 @@
-// Hooks BankPanelDraw. Each frame:
-// - Finds search_input widget, exposes it for WndProcHook
-// - Tracks click-based "input enabled" state
-// - Syncs widget +0x551 focus byte to g_inputEnabled
-// - Detects DropGoldModal-open for WndProcHook
-// - Reads search text, logs match count for the visible tab
-// - Determines visible tab index (BankTabs > ImageN +0x90 == 1)
-// - Computes current containerId: Personal=1, Shared=sharedBase+(tabIdx-1)
-//   where sharedBase = *(uint32_t*)(*(pInventory+0x68))
-// - Walks unit hash for items with page=7 AND containerId==current,
-//   reads each item's grid (cx,cy) from *(pItem+0x38)+0x10/+0x14
-// - Builds 16x13 match grid, darkens cells that don't contain a matching
-//   item (translucent black overlay). Empty cells are also darkened.
 #include <Windows.h>
 #include <MinHook.h>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <cctype>
@@ -30,6 +18,7 @@ namespace {
     constexpr uint32_t RVA_PlayerUnitHash = 0x1D442E0;
     constexpr uint32_t RVA_PanelManager = 0x1D7C4E8;
     constexpr uint32_t RVA_DrawFilledRect = 0x439280;
+    constexpr uint32_t RVA_ResolvePos = 0x576F00;
 
     constexpr size_t OFF_UnitClassId = 0x04;
     constexpr size_t OFF_UnitItemData = 0x10;
@@ -41,6 +30,8 @@ namespace {
     constexpr size_t OFF_ItemDataPage = 0xB8;
     constexpr size_t ROW_STRIDE = 0x1B4;
     constexpr size_t OFF_RowNameId = 0xFC;
+    constexpr size_t OFF_RowInvWidth = 0x116;
+    constexpr size_t OFF_RowInvHeight = 0x117;
 
     constexpr size_t OFF_StaticPathX = 0x10;
     constexpr size_t OFF_StaticPathY = 0x14;
@@ -51,6 +42,7 @@ namespace {
     constexpr size_t OFF_WidgetRectY = 0x74;
     constexpr size_t OFF_WidgetRectW = 0x78;
     constexpr size_t OFF_WidgetRectH = 0x7C;
+    constexpr size_t OFF_WidgetScale = 0x80;
 
     constexpr size_t OFF_WidgetString = 0x520;
     constexpr size_t OFF_WidgetStringSize = 0x528;
@@ -60,21 +52,14 @@ namespace {
     constexpr size_t OFF_WidgetFocused = 0x551;
     constexpr size_t OFF_TabImageActive = 0x90;
 
+    constexpr size_t OFF_GridCellW = 0x580;
+    constexpr size_t OFF_GridCellH = 0x584;
+    constexpr size_t OFF_GridCols = 0x5F0;
+    constexpr size_t OFF_GridRows = 0x5F4;
+
     constexpr size_t OFF_NodeNamePtr = 0x08;
     constexpr size_t OFF_NodeChildren = 0x58;
     constexpr size_t OFF_NodeChildCnt = 0x60;
-
-    constexpr size_t OFF_RowInvWidth = 0x116;
-    constexpr size_t OFF_RowInvHeight = 0x117;
-
-    constexpr float VIRTUAL_HEIGHT = 2160.0f;
-
-    // Stash grid origin in screen pixels at 1920x1080. Cell (0,0) top-left.
-    constexpr int GRID_ORIGIN_X = 46;
-    constexpr int GRID_ORIGIN_Y = 122;
-    constexpr int CELL_PX = 49;
-    constexpr int STASH_W = 16;
-    constexpr int STASH_H = 13;
 
     constexpr uint32_t PAGE_STASH = 7;
     constexpr uint32_t PERSONAL_CONTAINER_ID = 1;
@@ -83,6 +68,7 @@ namespace {
     using WidgetFindChild_t = void* (__fastcall*)(void* pParent, const char* name);
     using StringLookup_t = const char* (__fastcall*)(uint16_t key, void* stringTable);
     using DrawFilledRect_t = void(__fastcall*)(int x1, int y1, int x2, int y2, const float color[4]);
+    using ResolvePos_t = uint64_t(__fastcall*)(void* pWidget, uint64_t* outXY);
 
     BankPanelDraw_t   oBankPanelDraw = nullptr;
     WidgetFindChild_t pWidgetFindChild = nullptr;
@@ -112,18 +98,6 @@ namespace {
         memcpy(out, src, n);
         out[n] = '\0';
         return n;
-    }
-
-    // Reads item inventory width/height (in cells) from the items table.
-    // Returns false on bad classId or null table.
-    bool GetItemDimensions(uint32_t classId, uint8_t& outW, uint8_t& outH) {
-        auto itemsBase = *reinterpret_cast<uint8_t**>(Pattern::Address(RVA_ItemsTablePtr));
-        auto maxId = *reinterpret_cast<uint32_t*>(Pattern::Address(RVA_ItemsTableCount));
-        if (!itemsBase || classId >= maxId) return false;
-        uint8_t* row = itemsBase + classId * ROW_STRIDE;
-        outW = *(row + OFF_RowInvWidth);
-        outH = *(row + OFF_RowInvHeight);
-        return true;
     }
 
     void StripColorCodes(const char* src, char* out, size_t outCap) {
@@ -173,14 +147,16 @@ namespace {
         return ContainsCI(clean, needle);
     }
 
-    bool PointInWidget(void* pWidget, int virtualX, int virtualY) {
-        auto base = reinterpret_cast<uint8_t*>(pWidget);
-        int x = *reinterpret_cast<int32_t*>(base + OFF_WidgetRectX);
-        int y = *reinterpret_cast<int32_t*>(base + OFF_WidgetRectY);
-        int w = *reinterpret_cast<int32_t*>(base + OFF_WidgetRectW);
-        int h = *reinterpret_cast<int32_t*>(base + OFF_WidgetRectH);
-        return virtualX >= x && virtualX < (x + w)
-            && virtualY >= y && virtualY < (y + h);
+    void GetItemDimensions(uint32_t classId, uint8_t& outW, uint8_t& outH) {
+        outW = 1;
+        outH = 1;
+        auto itemsBase = *reinterpret_cast<uint8_t**>(Pattern::Address(RVA_ItemsTablePtr));
+        auto maxId = *reinterpret_cast<uint32_t*>(Pattern::Address(RVA_ItemsTableCount));
+        if (!itemsBase || classId >= maxId) return;
+        uint8_t w = *reinterpret_cast<uint8_t*>(itemsBase + classId * ROW_STRIDE + OFF_RowInvWidth);
+        uint8_t h = *reinterpret_cast<uint8_t*>(itemsBase + classId * ROW_STRIDE + OFF_RowInvHeight);
+        if (w >= 1 && w <= 8) outW = w;
+        if (h >= 1 && h <= 8) outH = h;
     }
 
     bool HasNamedDescendant(uint8_t* node, const char* name, int depth) {
@@ -201,24 +177,39 @@ namespace {
         return false;
     }
 
-    // Find a named descendant pointer (returns the node).
-    uint8_t* FindNamedDescendant(uint8_t* node, const char* name, int depth) {
-        if (!node || depth > 8) return nullptr;
-        const char* np = *reinterpret_cast<const char**>(node + OFF_NodeNamePtr);
-        if (np) {
-            __try {
-                if (strcmp(np, name) == 0) return node;
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER) {}
+    // Resolve a widget's screen-space top-left via D2R's own anchor resolver.
+    bool ResolveWidgetTopLeft(void* pWidget, int32_t& outX, int32_t& outY) {
+        if (!pWidget) return false;
+        auto resolvePos = reinterpret_cast<ResolvePos_t>(Pattern::Address(RVA_ResolvePos));
+        uint64_t xy = 0;
+        resolvePos(pWidget, &xy);
+        outX = static_cast<int32_t>(xy & 0xFFFFFFFF);
+        outY = static_cast<int32_t>(xy >> 32);
+        return true;
+    }
+
+    float ResolveAccumulatedScale(void* pWidget) {
+        if (!pWidget) return 1.0f;
+        float accum = 1.0f;
+        uint8_t* node = reinterpret_cast<uint8_t*>(pWidget);
+        for (int depth = 0; node && depth < 16; depth++) {
+            float s = *reinterpret_cast<float*>(node + OFF_WidgetScale);
+            if (s > 0.001f) accum *= s;
+            node = *reinterpret_cast<uint8_t**>(node + 0x30);
         }
-        uint8_t** data = *reinterpret_cast<uint8_t***>(node + OFF_NodeChildren);
-        uint64_t count = *reinterpret_cast<uint64_t*>(node + OFF_NodeChildCnt);
-        if (!data || count == 0 || count > 256) return nullptr;
-        for (uint64_t i = 0; i < count; i++) {
-            uint8_t* r = FindNamedDescendant(data[i], name, depth + 1);
-            if (r) return r;
-        }
-        return nullptr;
+        return accum;
+    }
+
+    bool PointInResolvedWidget(void* pWidget, int cx, int cy) {
+        int32_t rx, ry;
+        if (!ResolveWidgetTopLeft(pWidget, rx, ry)) return false;
+        auto base = reinterpret_cast<uint8_t*>(pWidget);
+        int32_t declW = *reinterpret_cast<int32_t*>(base + OFF_WidgetRectW);
+        int32_t declH = *reinterpret_cast<int32_t*>(base + OFF_WidgetRectH);
+        float scale = ResolveAccumulatedScale(pWidget);
+        int32_t rw = static_cast<int32_t>(declW * scale);
+        int32_t rh = static_cast<int32_t>(declH * scale);
+        return cx >= rx && cx < rx + rw && cy >= ry && cy < ry + rh;
     }
 
     void UpdateInputEnabledFromClick(void* pSearch) {
@@ -236,15 +227,9 @@ namespace {
         POINT cursor;
         if (!GetCursorPos(&cursor)) return;
         if (!ScreenToClient(hWnd, &cursor)) return;
-        RECT client;
-        if (!GetClientRect(hWnd, &client)) return;
-        int clientH = client.bottom - client.top;
-        if (clientH <= 0) return;
-        float scale = VIRTUAL_HEIGHT / static_cast<float>(clientH);
-        int virtualX = static_cast<int>(cursor.x * scale);
-        int virtualY = static_cast<int>(cursor.y * scale);
-        bool clickedInside = PointInWidget(pSearch, virtualX, virtualY);
-        g_inputEnabled.store(clickedInside, std::memory_order_relaxed);
+        bool inside = PointInResolvedWidget(pSearch,
+            static_cast<int>(cursor.x), static_cast<int>(cursor.y));
+        g_inputEnabled.store(inside, std::memory_order_relaxed);
     }
 
     void SyncFocusByte(void* pSearch) {
@@ -265,9 +250,6 @@ namespace {
         return nullptr;
     }
 
-    // Returns the active tab index (0=Personal, 1..7=Shared) by scanning
-    // BankTabs children for the Image whose +0x90 byte is 1. Returns -1
-    // if not found.
     int GetActiveTabIndex(void* pBankPanel) {
         void* pTabs = pWidgetFindChild(pBankPanel, "BankTabs");
         if (!pTabs) return -1;
@@ -275,8 +257,6 @@ namespace {
         uint8_t** data = *reinterpret_cast<uint8_t***>(base + OFF_NodeChildren);
         uint64_t count = *reinterpret_cast<uint64_t*>(base + OFF_NodeChildCnt);
         if (!data || count == 0 || count > 256) return -1;
-        // Children alternate ImageN, TextN. Walk all children, find Image
-        // with +0x90 = 1.
         for (uint64_t i = 0; i < count; i++) {
             uint8_t* child = data[i];
             if (!child) continue;
@@ -293,8 +273,6 @@ namespace {
         return -1;
     }
 
-    // Returns the shared-tab base container ID. The 7 shared tabs use
-    // sequential IDs starting from this base. Personal stash uses ID 1.
     bool GetSharedTabBaseId(uint32_t& outBase) {
         uint8_t* player = FindPlayerUnit();
         if (!player) return false;
@@ -306,7 +284,6 @@ namespace {
         return true;
     }
 
-    // Compute the containerId of the current visible tab, or 0 if unknown.
     uint32_t GetVisibleContainerId(void* pBankPanel) {
         int tabIdx = GetActiveTabIndex(pBankPanel);
         if (tabIdx < 0) return 0;
@@ -316,15 +293,32 @@ namespace {
         return base + static_cast<uint32_t>(tabIdx - 1);
     }
 
-    // Walk every stash item visible in the current tab. For each matching
-    // item, mark its (cx, cy) cell as "matching". Then darken every cell
-    // that is NOT marked. Empty cells get darkened too.
     void DarkenNonMatchingCells(const char* needle, void* pBankPanel) {
         if (!needle || !*needle || !pDrawFilledRect) return;
         uint32_t visibleCid = GetVisibleContainerId(pBankPanel);
         if (visibleCid == 0) return;
 
-        bool match[STASH_W * STASH_H] = {};
+        void* pGrid = pWidgetFindChild(pBankPanel, "grid");
+        if (!pGrid) return;
+
+        auto gbase = reinterpret_cast<uint8_t*>(pGrid);
+        int32_t cellW = *reinterpret_cast<int32_t*>(gbase + OFF_GridCellW);
+        int32_t cellH = *reinterpret_cast<int32_t*>(gbase + OFF_GridCellH);
+        int32_t gridCols = *reinterpret_cast<int32_t*>(gbase + OFF_GridCols);
+        int32_t gridRows = *reinterpret_cast<int32_t*>(gbase + OFF_GridRows);
+        if (cellW <= 0 || cellH <= 0 || gridCols <= 0 || gridRows <= 0) return;
+        if (gridCols > 64 || gridRows > 64) return;
+
+        float scale = ResolveAccumulatedScale(pGrid);
+        cellW = static_cast<int32_t>(cellW * scale);
+        cellH = static_cast<int32_t>(cellH * scale);
+        if (cellW <= 0 || cellH <= 0) return;
+
+        int32_t gridX = 0, gridY = 0;
+        if (!ResolveWidgetTopLeft(pGrid, gridX, gridY)) return;
+
+        constexpr int MAX_CELLS = 64;
+        bool match[MAX_CELLS * MAX_CELLS] = {};
 
         auto buckets = reinterpret_cast<uint8_t**>(Pattern::Address(RVA_UnitHashItems));
         for (int i = 0; i < 128; i++) {
@@ -338,17 +332,13 @@ namespace {
                         if (pStaticPath) {
                             uint32_t cx = *reinterpret_cast<uint32_t*>(pStaticPath + OFF_StaticPathX);
                             uint32_t cy = *reinterpret_cast<uint32_t*>(pStaticPath + OFF_StaticPathY);
-                            uint32_t classId = *reinterpret_cast<uint32_t*>(unit + OFF_UnitClassId);
                             uint8_t iw = 1, ih = 1;
-                            GetItemDimensions(classId, iw, ih);
-                            if (iw == 0) iw = 1;
-                            if (ih == 0) ih = 1;
+                            GetItemDimensions(*reinterpret_cast<uint32_t*>(unit + OFF_UnitClassId), iw, ih);
                             for (uint32_t dy = 0; dy < ih; dy++) {
                                 for (uint32_t dx = 0; dx < iw; dx++) {
-                                    uint32_t mx = cx + dx;
-                                    uint32_t my = cy + dy;
-                                    if (mx < STASH_W && my < STASH_H) {
-                                        match[my * STASH_W + mx] = true;
+                                    uint32_t x = cx + dx, y = cy + dy;
+                                    if (x < (uint32_t)gridCols && y < (uint32_t)gridRows) {
+                                        match[y * gridCols + x] = true;
                                     }
                                 }
                             }
@@ -360,17 +350,16 @@ namespace {
         }
 
         static const float dim[4] = { 0.0f, 0.0f, 0.0f, 0.6f };
-        for (int cy = 0; cy < STASH_H; cy++) {
-            for (int cx = 0; cx < STASH_W; cx++) {
-                if (match[cy * STASH_W + cx]) continue;
-                int x1 = GRID_ORIGIN_X + cx * CELL_PX;
-                int y1 = GRID_ORIGIN_Y + cy * CELL_PX;
-                pDrawFilledRect(x1, y1, x1 + CELL_PX, y1 + CELL_PX, dim);
+        for (int cy = 0; cy < gridRows; cy++) {
+            for (int cx = 0; cx < gridCols; cx++) {
+                if (match[cy * gridCols + cx]) continue;
+                int x1 = gridX + cx * cellW;
+                int y1 = gridY + cy * cellH;
+                pDrawFilledRect(x1, y1, x1 + cellW, y1 + cellH, dim);
             }
         }
     }
 
-    // Count matches in the current visible tab only.
     int CountVisibleTabMatches(const char* needle, void* pBankPanel) {
         uint32_t visibleCid = GetVisibleContainerId(pBankPanel);
         if (visibleCid == 0) return 0;

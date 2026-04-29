@@ -17,12 +17,6 @@
 
 #pragma comment(lib, "Wtsapi32.lib")
 
-// The DLL sits next to the injector. We copy it to a renamed path before
-// loading so repeated injections don't fight Windows' "file locked by
-// another process" behaviour on the original filename.
-#define ORIGINAL_DLL_NAME L"StashSearch.dll"
-#define RENAMED_DLL_NAME  L"stashsearchb.dll"
-
 static std::wstring ExePath();
 static std::vector<DWORD> GetPIDs(std::wstring processName);
 static void EjectDLL(int pid, const std::wstring& moduleName);
@@ -30,14 +24,27 @@ static void InjectDLL(int pid, const std::wstring& path);
 
 int main(int argc, char* /*argv*/[])
 {
-    if (argc != 2) {
-        std::wcerr << L"Usage: StashSearchInjector.exe \"D2R.exe\"" << std::endl;
+    if (argc != 3) {
+        std::wcerr << L"Usage: StashSearchInjector.exe \"D2R.exe\" \"StashSearch.dll\"" << std::endl;
+        std::wcerr << L"       StashSearchInjector.exe \"D2R.exe\" \"StateExtension.dll\"" << std::endl;
         return -1;
     }
 
     int wargc = 0;
     wchar_t** wargv = CommandLineToArgvW(GetCommandLineW(), &wargc);
     std::wcout << L"[+] Target process: " << wargv[1] << std::endl;
+    std::wcout << L"[+] DLL to inject:  " << wargv[2] << std::endl;
+
+    std::wstring originalDllName = wargv[1 + 1];
+
+    std::wstring renamedDllName = originalDllName;
+    auto dotPos = renamedDllName.find_last_of(L'.');
+    if (dotPos != std::wstring::npos) {
+        renamedDllName.insert(dotPos, L"b");
+    }
+    else {
+        renamedDllName += L"b";
+    }
 
     std::vector<DWORD> pids = GetPIDs(wargv[1]);
     if (pids.empty()) {
@@ -46,12 +53,12 @@ int main(int argc, char* /*argv*/[])
     }
 
     for (DWORD pid : pids) {
-        std::wstring originalDllPath = std::format(L"{}\\{}", ExePath(), ORIGINAL_DLL_NAME);
-        std::wstring dllPath = std::format(L"{}\\{}", ExePath(), RENAMED_DLL_NAME);
+        std::wstring originalDllPath = std::format(L"{}\\{}", ExePath(), originalDllName);
+        std::wstring dllPath = std::format(L"{}\\{}", ExePath(), renamedDllName);
 
         std::wcout << L"[+] Injecting into PID " << pid << std::endl;
 
-        EjectDLL(static_cast<int>(pid), RENAMED_DLL_NAME);
+        EjectDLL(static_cast<int>(pid), renamedDllName);
 
         std::error_code ec;
         std::filesystem::copy(originalDllPath, dllPath,
